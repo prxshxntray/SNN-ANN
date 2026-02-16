@@ -1,4 +1,4 @@
-# N-MNIST Neuromorphic Vision Benchmark 🧠⚡️
+# N-MNIST Neuromorphic Vision Benchmark 
 
 ## Overview
 This repository contains a comprehensive benchmark analysis comparing diverse neural network architectures on the **N-MNIST (Neuromorphic MNIST)** dataset. The study evaluates the trade-offs between biological plausibility, energy efficiency, and classification speed.
@@ -9,7 +9,7 @@ This repository contains a comprehensive benchmark analysis comparing diverse ne
 3.  **Hybrid SNN-ANN**: A novel architecture combining a spiking feature extractor with an ANN classifier for rapid decision-making.
 4.  **CNN Baseline**: Standard CNN trained on accumulated event frames (static baseline).
 
-## Key Findings 🏆
+## Key Findings 
 | Model | Accuracy | Decision Latency (Steps) | Avg Spikes / Energy Proxy |
 | :--- | :--- | :--- | :--- |
 | **Hybrid SNN-ANN** | **98.71%** | **2.0** (Fastest) | ~16,241 |
@@ -17,7 +17,7 @@ This repository contains a comprehensive benchmark analysis comparing diverse ne
 | **RNN (GRU)** | 98.39% | 4.0 | 125M MACs |
 | **CNN Baseline** | 95.66% | 7.0 | 6.7M MACs |
 
-### 🚀 The "Hybrid Advantage"
+### The "Hybrid Advantage"
 Our results demonstrate that the **Hybrid SNN-ANN** architecture achieves the best balance of performance, reaching the highest accuracy with the fastest time-to-decision (just 2 time steps). This confirms the efficacy of **mixed-signal approaches** for real-world neuromorphic vision tasks.
 
 ## Repository Contents
