@@ -1,0 +1,77 @@
+You are building a Next.js (App Router) + TypeScript web app for “Wattr”, a data-centre intelligence demo. This phase is frontend-only with mock data (no backend). The site must feel like a calm, industrial control-room interface.
+
+IMPORTANT VISUAL REFERENCES:
+
+1. Use the attached isometric data-centre reference image as the scene/style anchor (racks + overhead piping + workstations).
+2. Match Wattr brand colour from the attached logo: PRIMARY ACCENT = #70A0D0.
+
+## Brand colour system (must follow)
+
+* Primary (Wattr Blue): #70A0D0
+* Primary Dark: #3872AC
+* Primary Darker: #2C5985
+* Primary Light: #9EBFDF
+* Background: near-black / graphite (e.g. #0B0F14 to #121824 range)
+* Heat accent (only for “high load”): #FF6A3D (sparingly)
+
+Use these consistently:
+
+* Buttons, focus rings, highlights, chart lines: Wattr Blue (#70A0D0)
+* “Wattr ON” state: Wattr Blue
+* Rack heatmap: blue→amber/orange only as load increases (never neon cyberpunk)
+
+## Deliverable (Phase 1)
+
+Build these routes:
+
+1. `/` Home (WebGL-first)
+
+* Full-screen React Three Fiber (R3F) scene inspired by the attached data-centre image.
+* Scene: floor plane + rack clusters + simple “pipes” geometry overhead + a few desk/monitor blocks (primitive geometry OK).
+* Lighting: realistic industrial; subtle blue/cyan tint using Wattr Blue.
+* OrbitControls enabled (smooth + constrained).
+* 4 clickable hotspots: “Server Room”, “Cooling Plant”, “Power Room”, “NOC”.
+
+  * Clicking animates camera to preset views + shows a small overlay panel with 2–3 metrics.
+* Add a workload slider (0–150) that changes rack “heat” visually:
+
+  * Low load: emissive/accents in Wattr Blue (#70A0D0)
+  * Higher load: gradually shifts toward warmer tones (use #FF6A3D sparingly) and increases emissive intensity
+* Below the hero: scroll section with left-side controls and right-side live 3D preview reacting in real time.
+
+2. `/noc` Operations View
+
+* Mock NOC dashboard:
+
+  * Left: rack grid map with status tiles (green/yellow/red)
+  * Center: Recharts time-series (next 6 hours) for Thermal Load + Water Draw (mock data)
+  * Right: Alerts + Recommended Actions (mock)
+* Toggle “Wattr On/Off” changes KPI deltas + chart lines (mock differences only).
+* Charts + key highlights must use Wattr Blue for the primary series.
+
+3. `/technology`
+
+* Clean architecture explanation: IT Telemetry → Forecast Engine → Simulation → Recommendations → Control Interface
+* Use cards/diagram-like layout (no images required) with Wattr Blue accents.
+
+4. `/contact`
+
+* Minimal form UI (no submission needed) + “In active development” note.
+
+## Tech constraints
+
+* Next.js App Router + TypeScript
+* Tailwind CSS (shadcn/ui optional)
+* three + @react-three/fiber + @react-three/drei
+* Zustand store: workload, ambientTemp, waterCostIndex, aiBurst, wattrEnabled, scenario
+* Recharts for charts
+* Performance: lazy-load the 3D canvas, show a loading state, keep it smooth.
+
+## Output requirements
+
+* Provide full file structure + key code files.
+* Include exact install commands.
+* Ensure it runs in Replit without extra configuration.
+* Use local mock data generators in `lib/`.
+
+Build `/` first, then `/noc`, then the simple pages. The whole UI + scene must stay consistent with Wattr Blue (#70A0D0) and the attached isometric data-centre reference.
