@@ -4,10 +4,72 @@ import { useWattrStore } from "@/lib/store";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
-import { Thermometer, Zap, Droplets, Activity, X } from "lucide-react";
+import { Thermometer, Zap, Droplets, Activity, X, BookOpen } from "lucide-react";
 import type { RackSelection } from "@/components/DataCentreScene";
 
 const DataCentreScene = lazy(() => import("@/components/DataCentreScene"));
+
+const researchPapers = [
+  {
+    title: "Practical PUE Optimization in Heterogeneous Data Centres",
+    authors: "Rahman, Chen, Patel",
+    venue: "ACM e-Energy",
+    year: "2023",
+    status: "Read",
+    summary: "Benchmark-driven cooling setpoint tuning with a focus on minimizing thermal hotspots.",
+    tags: ["PUE", "Cooling", "Operations"],
+  },
+  {
+    title: "Learning Thermal Dynamics with Physics-Informed Neural Nets",
+    authors: "Li, Alvarez, Nandakumar",
+    venue: "NeurIPS",
+    year: "2022",
+    status: "Read",
+    summary: "PINN framework to approximate CFD behavior for faster inference in control loops.",
+    tags: ["PINNs", "Thermal", "CFD"],
+  },
+  {
+    title: "Risk-Aware Load Shaping for AI Bursts",
+    authors: "Singh, Duarte, Long",
+    venue: "IEEE Transactions on Smart Grid",
+    year: "2024",
+    status: "Read",
+    summary: "Stochastic control policies that cap thermal excursions during sudden GPU spikes.",
+    tags: ["AI Burst", "Control", "Reliability"],
+  },
+  {
+    title: "Water-to-Compute Efficiency Metrics for Cooling Systems",
+    authors: "Nair, Kwon, Ochoa",
+    venue: "ASHRAE Journal",
+    year: "2023",
+    status: "Reviewing",
+    summary: "A comparative study of WUE metrics across evaporative and liquid cooling stacks.",
+    tags: ["WUE", "Hydraulics", "Cooling"],
+  },
+  {
+    title: "Graph-Based Fault Detection for Multi-Zone Facilities",
+    authors: "Zhang, Ibarra, Kline",
+    venue: "ICLR",
+    year: "2024",
+    status: "Reviewing",
+    summary: "Graph neural nets for early anomaly detection across connected HVAC subsystems.",
+    tags: ["GNNs", "Anomaly", "Monitoring"],
+  },
+  {
+    title: "Human-in-the-Loop Autonomy for Data Centre Operations",
+    authors: "Martin, Odegaard, Silva",
+    venue: "CHI",
+    year: "2022",
+    status: "Read",
+    summary: "Interface patterns that build operator trust during automated control actions.",
+    tags: ["HCI", "Autonomy", "Ops"],
+  },
+];
+
+const paperStatusStyles: Record<string, string> = {
+  Read: "bg-emerald-500/15 text-emerald-400 border-emerald-500/30",
+  Reviewing: "bg-amber-500/15 text-amber-400 border-amber-500/30",
+};
 
 function LoadingScene() {
   return (
@@ -232,6 +294,74 @@ export default function Home() {
                 ))}
               </div>
             </div>
+          </div>
+        </div>
+      </section>
+
+      {/* ── Research gallery ───────────────────────── */}
+      <section className="py-20 px-6 bg-[#0B0F14] border-t border-white/5">
+        <div className="max-w-7xl mx-auto">
+          <div className="text-center mb-12">
+            <p className="text-[#70A0D0] text-xs font-mono tracking-widest uppercase mb-2">Research Library</p>
+            <h2 className="text-3xl font-semibold text-white">Papers Under Review</h2>
+            <p className="text-white/50 mt-2 text-sm">
+              A live gallery of the work shaping our models — from thermal control to reliability at scale.
+            </p>
+          </div>
+
+          <div className="flex items-center justify-between text-xs text-white/30 mb-4 px-1">
+            <span className="font-mono uppercase tracking-widest lg:hidden">Swipe to explore</span>
+            <span className="font-mono uppercase tracking-widest hidden lg:block">Gallery view</span>
+            <div className="flex items-center gap-2">
+              <div className="h-px w-10 bg-gradient-to-r from-transparent via-white/20 to-transparent" />
+              <span className="text-white/40">Latest scan</span>
+            </div>
+          </div>
+
+          <div className="flex gap-6 overflow-x-auto pb-4 snap-x snap-mandatory lg:grid lg:grid-cols-3 lg:gap-6 lg:overflow-visible lg:pb-0">
+            {researchPapers.map((paper) => (
+              <article
+                key={`${paper.title}-${paper.year}`}
+                className="group relative min-w-[280px] lg:min-w-0 snap-start rounded-md border border-white/10 bg-[#0d1520] p-6 overflow-hidden"
+              >
+                <div className="absolute inset-0 bg-gradient-to-br from-[#0d1520] via-[#0d1520] to-[#0a111a] opacity-80" />
+                <div className="absolute -top-16 -right-16 w-40 h-40 bg-[#70A0D0]/10 blur-3xl opacity-0 group-hover:opacity-100 transition-opacity" />
+                <div className="absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-[#70A0D0]/40 to-transparent" />
+
+                <div className="relative">
+                  <div className="flex items-center justify-between mb-3">
+                    <Badge className={`text-[11px] uppercase ${paperStatusStyles[paper.status] || "bg-white/10 text-white/50 border-white/20"}`}>
+                      {paper.status}
+                    </Badge>
+                    <span className="text-white/30 text-xs font-mono">{paper.year} • {paper.venue}</span>
+                  </div>
+
+                  <div className="flex items-center gap-3 mb-3">
+                    <div className="h-9 w-9 rounded-md border border-[#70A0D0]/30 bg-[#70A0D0]/10 flex items-center justify-center">
+                      <BookOpen className="w-4 h-4 text-[#70A0D0]" />
+                    </div>
+                    <p className="text-white/40 text-xs font-mono tracking-widest uppercase">Research Note</p>
+                  </div>
+
+                  <h3 className="text-white text-lg font-semibold leading-snug mb-2 group-hover:text-[#70A0D0] transition-colors">
+                    {paper.title}
+                  </h3>
+                  <p className="text-white/40 text-xs mb-4">{paper.authors}</p>
+                  <p className="text-white/55 text-sm leading-relaxed mb-4">{paper.summary}</p>
+
+                  <div className="flex flex-wrap gap-2">
+                    {paper.tags.map((tag) => (
+                      <span
+                        key={tag}
+                        className="px-2.5 py-1 rounded-sm text-[11px] font-mono bg-[#70A0D0]/10 text-[#70A0D0] border border-[#70A0D0]/20"
+                      >
+                        {tag}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              </article>
+            ))}
           </div>
         </div>
       </section>
