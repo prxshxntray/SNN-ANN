@@ -1,14 +1,24 @@
 """
-PJM Wind Forecast — Final Model Architectures
-==============================================
-Three models for time-series forecasting, designed for head-to-head comparison:
+PJM Wind Forecast — Model Architectures (V5 + V6)
+===================================================
+Time-series forecasting models for head-to-head comparison:
 
-1. **GRUForecaster** (Baseline) — Pure ANN.
-2. **SNNForecaster** (Spiking) — Pure SNN with Raw+Delta input and Deep LIF.
-3. **HybridForecaster** (Combined) — Residual gating of SNN events into GRU.
+V5 Models (Baseline):
+  1. **GRUForecaster** — Pure ANN baseline.
+  2. **SNNForecaster** — Pure SNN with Raw+Delta input and Deep LIF.
+  3. **HybridForecaster** — Residual gating of SNN events into GRU.
+
+V6 Models (Literature-Informed, see architecture_evolution.md Phase 4):
+  4. **SNNForecasterV6** — Conv Spike Encoder, Temporal Alignment, BN, SpikingAttention.
+  5. **HybridForecasterV6** — Conv Spike Encoder → Downsample → GRU with SpikingAttention.
+
+Supporting Modules:
+  - **ConvSpikeEncoder** — Learned convolutional encoding (SeqSNN, ICML 2024)
+  - **SpikingAttention** — Sigmoid-gated Q·K^T attention (SpikSTAG / Spikeformer)
 
 All models share the same API:
     model(x)  where x : (batch, window_size, n_features) → (batch, horizon)
+    V6 models additionally support: model(x, return_trajectory=True) for DecodingLoss
 """
 
 from __future__ import annotations
@@ -260,4 +270,403 @@ class HybridForecaster(nn.Module):
             self.snn_lif1.output = False # default
             self.snn_lif2.output = True
             
+            return total_spikes
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  V6 ARCHITECTURES — Literature-Informed Improvements
+# ═══════════════════════════════════════════════════════════════════════
+# Based on:
+#   Paper 1: SpikSTAG (Dual-Path Fusion, SSA)
+#   Paper 2: Spikeformer (Conv Tokenizer, STA)
+#   Paper 3: Lucas & Portillo (PWM encoding, spike-timing loss)
+#   Paper 4: Manna et al. (Derivative encoding, DecodingLoss)
+#   Paper 6: SeqSNN / ICML 2024 (Conv Spike Encoder, Temporal Alignment,
+#            Spike-RNN, BN before spiking, Beta sensitivity)
+#   Paper 8: Khoee et al. (Sparsity control, lateral inhibition)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class ConvSpikeEncoder(nn.Module):
+    """
+    Convolutional Spike Encoder from SeqSNN (Lv et al., ICML 2024).
+    
+    Replaces manual raw+delta with a *learned* encoding that captures
+    morphological (shape) features in subsequences. Paper showed +0.09 R²
+    improvement over delta encoding.
+    
+    Architecture:
+        Conv1d(input → hidden, kernel_size) → BatchNorm → LIF
+    
+    The conv kernel learns to detect temporal shapes (ramps, dips, spikes)
+    rather than just point-to-point differences.
+    
+    Temporal Alignment:
+        Each data timestep generates Tₛ spiking events via the conv encoder,
+        giving the SNN finer temporal granularity (ΔT = Tₛ · Δt).
+    """
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        spiking_steps: int = 4,
+        kernel_size: int = 3,
+    ):
+        super().__init__()
+        import snntorch as snn
+        from snntorch import surrogate
+        
+        self.spiking_steps = spiking_steps
+        self.hidden_size = hidden_size
+        
+        # Conv encoder expands each timestep into spiking_steps channels
+        # Paper 6: S = SN(BN(Conv(X)))
+        self.conv = nn.Conv1d(
+            in_channels=input_size,
+            out_channels=hidden_size * spiking_steps,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,  # same-padding
+            groups=1,
+        )
+        self.bn = nn.BatchNorm1d(hidden_size * spiking_steps)
+        
+        spike_grad = surrogate.fast_sigmoid(slope=25)
+        self.lif = snn.Leaky(
+            beta=torch.full((hidden_size,), 0.9),
+            learn_beta=True,
+            spike_grad=spike_grad,
+            init_hidden=True,
+        )
+    
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: (B, T, input_size) — raw time-series input
+        Returns:
+            spikes: (Tₛ*T, B, hidden) — spike train
+            mem:    (Tₛ*T, B, hidden) — membrane potentials
+        """
+        import snntorch as snn
+        from snntorch import utils
+        
+        B, T, C = x.shape
+        
+        # Conv1d expects (B, C, T)
+        h = self.conv(x.transpose(1, 2))      # (B, hidden*Ts, T)
+        h = self.bn(h)                          # BatchNorm before spiking
+        h = h.transpose(1, 2)                   # (B, T, hidden*Ts)
+        
+        # Reshape to (B, T, Ts, hidden) → (B, T*Ts, hidden) → (T*Ts, B, hidden)
+        h = h.view(B, T, self.spiking_steps, self.hidden_size)
+        h = h.reshape(B, T * self.spiking_steps, self.hidden_size)
+        h = h.permute(1, 0, 2)  # (T*Ts, B, hidden)
+        
+        spk_rec, mem_rec = [], []
+        for step in range(h.size(0)):
+            spk = self.lif(h[step])
+            spk_rec.append(spk)
+            mem_rec.append(self.lif.mem)        # access internal membrane state
+        
+        return torch.stack(spk_rec), torch.stack(mem_rec)
+
+
+class SpikingAttention(nn.Module):
+    """
+    Spiking Self-Attention (SSA) — lightweight version.
+    
+    Inspired by SpikSTAG (Paper 1) and Spikeformer (Paper 2).
+    Uses spike-based Q·K^T without softmax for hardware friendliness.
+    For V6 we use a simplified version: learned temporal weighting
+    with batch normalization for stability.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.bn = nn.BatchNorm1d(dim)
+        self.scale = dim ** -0.5
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, T, C)
+        Returns:
+            out: (B, C) — attended summary
+        """
+        Q = self.q_proj(x)  # (B, T, C)
+        K = self.k_proj(x)  # (B, T, C)
+        V = self.v_proj(x)  # (B, T, C)
+        
+        # Scaled dot-product attention (spike-friendly: no softmax exp)
+        # Use sigmoid instead of softmax for bounded, spike-compatible attention
+        attn = torch.sigmoid(torch.bmm(Q, K.transpose(1, 2)) * self.scale)  # (B, T, T)
+        attended = torch.bmm(attn, V)  # (B, T, C)
+        
+        # Pool over time
+        out = attended.mean(dim=1)  # (B, C)
+        out = self.bn(out)
+        return out
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  4. V6 PURE SNN
+# ═══════════════════════════════════════════════════════════════════════
+
+class SNNForecasterV6(nn.Module):
+    """
+    V6 Spiking Neural Network for Time-Series Forecasting.
+    
+    Improvements over V5:
+    ---------------------
+    1. **Conv Spike Encoder** (Paper 6): Replaces raw+delta with learned
+       convolutional encoding that captures temporal morphology.
+    2. **Temporal Alignment** (Paper 6): Tₛ spiking sub-steps per data
+       timestep for finer temporal resolution.
+    3. **Batch Norm before ALL LIF layers** (Paper 6): Prevents dead neurons
+       and stabilizes surrogate gradients throughout the network.
+    4. **Spiking Attention** (Papers 1,2): Upgraded attention mechanism
+       with Q/K/V projections and sigmoid-gated weighting.
+    5. **Membrane trajectory output** (Paper 4): Exposes full membrane
+       sequences for DecodingLoss training.
+    """
+    def __init__(
+        self,
+        input_size: int,
+        horizon: int,
+        hidden: int = 256,
+        spiking_steps: int = 4,
+    ):
+        super().__init__()
+        import snntorch as snn
+        from snntorch import surrogate
+        
+        self.hidden = hidden
+        self.spiking_steps = spiking_steps
+        
+        # V6: Convolutional Spike Encoder (replaces manual raw+delta)
+        self.encoder = ConvSpikeEncoder(
+            input_size=input_size,
+            hidden_size=hidden,
+            spiking_steps=spiking_steps,
+        )
+        
+        # V6: BN before each LIF layer
+        self.bn2 = nn.BatchNorm1d(hidden)
+        self.bn3 = nn.BatchNorm1d(hidden)
+        
+        spike_grad = surrogate.fast_sigmoid(slope=25)
+        
+        # Deep LIF stack with learnable leak (PLIF)
+        self.lif2 = snn.Leaky(
+            beta=torch.full((hidden,), 0.9), learn_beta=True,
+            spike_grad=spike_grad, init_hidden=True,
+        )
+        self.lif3 = snn.Leaky(
+            beta=torch.full((hidden,), 0.9), learn_beta=True,
+            spike_grad=spike_grad, init_hidden=True, output=True,
+        )
+        
+        # V6: Spiking Attention (upgraded from V5 TemporalAttention)
+        self.attn = SpikingAttention(hidden)
+        self.head = nn.Linear(hidden, horizon)
+    
+    def update_surrogate_slope(self, new_slope: float):
+        from snntorch import surrogate
+        spike_grad = surrogate.fast_sigmoid(slope=new_slope)
+        self.encoder.lif.spike_grad = spike_grad
+        self.lif2.spike_grad = spike_grad
+        self.lif3.spike_grad = spike_grad
+    
+    def forward(self, x: torch.Tensor, return_trajectory: bool = False):
+        """
+        Args:
+            x: (B, T, input_size)
+            return_trajectory: If True, return membrane trajectory for DecodingLoss
+        Returns:
+            predictions: (B, horizon)
+            membrane_trajectory: (T_total, B, hidden) — only if return_trajectory=True
+        """
+        import snntorch as snn
+        from snntorch import utils
+        utils.reset(self)
+        
+        # Clamp learnable betas
+        self.encoder.lif.beta.data.clamp_(0.0, 0.99)
+        self.lif2.beta.data.clamp_(0.0, 0.99)
+        self.lif3.beta.data.clamp_(0.0, 0.99)
+        
+        # 1. Conv Spike Encoder → (T*Ts, B, hidden)
+        spk_enc, mem_enc = self.encoder(x)
+        
+        # 2. Deep LIF stack with BN
+        mem_rec = []
+        spk_count = 0
+        T_total = spk_enc.size(0)
+        
+        for step in range(T_total):
+            # BN before spiking (Paper 6)
+            h = self.bn2(spk_enc[step])
+            s2 = self.lif2(h)
+            spk_count += s2.sum().item()
+            
+            h = self.bn3(s2)
+            _, mem3 = self.lif3(h)
+            mem_rec.append(mem3)
+        
+        mem_rec = torch.stack(mem_rec, dim=0)  # (T_total, B, hidden)
+        
+        # 3. Spiking Attention Readout
+        feat = self.attn(mem_rec.permute(1, 0, 2))  # (B, hidden)
+        predictions = self.head(feat)
+        
+        if return_trajectory:
+            return predictions, mem_rec
+        return predictions
+    
+    def spike_count(self, x: torch.Tensor) -> int:
+        import snntorch as snn
+        from snntorch import utils
+        utils.reset(self)
+        with torch.no_grad():
+            spk_enc, _ = self.encoder(x)
+            total_spikes = int(spk_enc.sum().item())
+            
+            T_total = spk_enc.size(0)
+            for step in range(T_total):
+                h = self.bn2(spk_enc[step])
+                s2 = self.lif2(h)
+                total_spikes += int(s2.sum().item())
+                h = self.bn3(s2)
+                s3 = self.lif3(h)
+                total_spikes += int(s3.sum().item()) if isinstance(s3, torch.Tensor) else 0
+            return total_spikes
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  5. V6 HYBRID FORECASTER
+# ═══════════════════════════════════════════════════════════════════════
+
+class HybridForecasterV6(nn.Module):
+    """
+    V6 Feature-Extraction SNN-GRU Hybrid.
+    
+    Improvements over V5:
+    ---------------------
+    1. **Conv Spike Encoder** for the SNN path (replaces manual delta)
+    2. **BN throughout** for stable training
+    3. **Temporal Alignment** with Tₛ sub-steps for richer spike features
+    4. **Downsampling** to match GRU's expected temporal resolution
+    5. **Membrane trajectory** exposed for DecodingLoss
+    
+    Architecture:
+        Input → Conv Spike Encoder → [spk features] → Downsample → concat(raw) → GRU → Head
+    """
+    def __init__(
+        self,
+        input_size: int,
+        horizon: int,
+        hidden: int = 128,
+        snn_dim: int = 128,
+        spiking_steps: int = 4,
+    ):
+        super().__init__()
+        import snntorch as snn
+        from snntorch import surrogate
+        
+        self.snn_dim = snn_dim
+        self.spiking_steps = spiking_steps
+        
+        # 1. SNN Enhancement Path with Conv Encoder
+        self.encoder = ConvSpikeEncoder(
+            input_size=input_size,
+            hidden_size=snn_dim,
+            spiking_steps=spiking_steps,
+        )
+        
+        # Second LIF layer for deeper spike processing
+        self.bn_snn2 = nn.BatchNorm1d(snn_dim)
+        spike_grad = surrogate.fast_sigmoid(slope=25)
+        self.snn_lif2 = snn.Leaky(
+            beta=torch.full((snn_dim,), 0.9), learn_beta=True,
+            spike_grad=spike_grad, init_hidden=True, output=True,
+        )
+        
+        # Downsample: average Tₛ sub-steps back to original T resolution
+        # so SNN features can be concatenated with raw input for GRU
+        
+        # 2. Chained GRU Path
+        self.gru = nn.GRU(input_size + snn_dim, hidden, batch_first=True)
+        self.gru_attn = SpikingAttention(hidden)
+        
+        self.head = nn.Linear(hidden, horizon)
+    
+    def update_surrogate_slope(self, new_slope: float):
+        from snntorch import surrogate
+        spike_grad = surrogate.fast_sigmoid(slope=new_slope)
+        self.encoder.lif.spike_grad = spike_grad
+        self.snn_lif2.spike_grad = spike_grad
+    
+    def forward(self, x: torch.Tensor, return_trajectory: bool = False):
+        """
+        Args:
+            x: (B, T, input_size)
+            return_trajectory: If True, return membrane trajectory
+        Returns:
+            predictions: (B, horizon)
+            membrane_trajectory: optional (T*Ts, B, snn_dim)
+        """
+        import snntorch as snn
+        from snntorch import utils
+        utils.reset(self)
+        
+        B, T, C = x.shape
+        
+        # Clamp betas
+        self.encoder.lif.beta.data.clamp_(0.0, 0.99)
+        self.snn_lif2.beta.data.clamp_(0.0, 0.99)
+        
+        # --- SNN Enhancement Path ---
+        spk_enc, mem_enc = self.encoder(x)  # (T*Ts, B, snn_dim)
+        
+        # Second LIF layer
+        mem_rec = []
+        T_total = spk_enc.size(0)
+        for step in range(T_total):
+            h = self.bn_snn2(spk_enc[step])
+            _, mem2 = self.snn_lif2(h)
+            mem_rec.append(mem2)
+        
+        mem_rec = torch.stack(mem_rec, dim=0)  # (T*Ts, B, snn_dim)
+        
+        # Downsample: average Tₛ sub-steps → (T, B, snn_dim)
+        mem_down = mem_rec.permute(1, 0, 2)  # (B, T*Ts, snn_dim)
+        mem_down = mem_down.reshape(B, T, self.spiking_steps, self.snn_dim)
+        mem_down = mem_down.mean(dim=2)  # (B, T, snn_dim)
+        
+        # --- Chained GRU Path ---
+        h_combined = torch.cat([x, mem_down], dim=-1)  # (B, T, input_size + snn_dim)
+        
+        gru_out, _ = self.gru(h_combined)
+        h_ann = self.gru_attn(gru_out)
+        
+        predictions = self.head(h_ann)
+        
+        if return_trajectory:
+            return predictions, mem_rec
+        return predictions
+    
+    def spike_count(self, x: torch.Tensor) -> int:
+        import snntorch as snn
+        from snntorch import utils
+        utils.reset(self)
+        with torch.no_grad():
+            spk_enc, _ = self.encoder(x)
+            total_spikes = int(spk_enc.sum().item())
+            
+            T_total = spk_enc.size(0)
+            for step in range(T_total):
+                h = self.bn_snn2(spk_enc[step])
+                spk2, _ = self.snn_lif2(h)
+                total_spikes += int(spk2.sum().item()) if isinstance(spk2, torch.Tensor) else 0
             return total_spikes
