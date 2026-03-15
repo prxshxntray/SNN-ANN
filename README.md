@@ -37,11 +37,16 @@ Typical focus:
 **Purpose:** Test SNN/hybrid feasibility on accessible datasets.
 
 You might find:
-- Vision experiments
-- Time-series experiments
+- Vision experiments (N-MNIST)
+- Time-series experiments (PJM Wind Forecasting)
 - Benchmark ML workloads
 
 **Objective:** Identify dataset characteristics that favour event-driven computation and hybrid gating approaches.
+
+**Architectural Evolution (PJM Time-Series Forecasting):**
+- **V1 (Initial):** Basic SNN rate encoding and parallel hybrid gating. *Result: SNN failed to learn continuous values (MAE ~3395 MW vs GRU ~368 MW).*
+- **V2 (Delta + Deep LIF):** Shifted to Delta encoding (tracking changes), 128h 3-layer LIF, and temporal attention. *Result: SNN spiked properly but remained blind to absolute power levels.*
+- **V3 (Raw+Delta & Residual Hybrid):** SNN receives concatenated Raw+Delta state. Hybrid model uses a **Residual Design** (zero-initialized gate adding SNN 'shock detection' features to a robust GRU baseline). *Result: Stable learning merging ANN baseline safety with SNN event-detection.*
 
 ---
 

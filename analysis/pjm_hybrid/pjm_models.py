@@ -87,22 +87,36 @@ class SNNForecaster(nn.Module):
         self.bn = nn.BatchNorm1d(hidden)
         
         spike_grad = surrogate.fast_sigmoid(slope=25)
-        self.lif1 = snn.Leaky(beta=0.9, spike_grad=spike_grad, init_hidden=True) #creates the first LIF neuron layer
-        self.lif2 = snn.Leaky(beta=0.9, spike_grad=spike_grad, init_hidden=True) #second LIF neuron stacked on top of first
+        # V5: PLIF Neurons (learn_beta=True) allows neurons to learn their own leak rates
+        self.lif1 = snn.Leaky(beta=torch.full((hidden,), 0.9), learn_beta=True, spike_grad=spike_grad, init_hidden=True) #creates the first PLIF neuron layer
+        self.lif2 = snn.Leaky(beta=torch.full((hidden,), 0.9), learn_beta=True, spike_grad=spike_grad, init_hidden=True) #second PLIF neuron stacked on top of first
         
-        # V4 Continuous Readout Layer
-        self.lif3 = snn.Leaky(beta=0.9, spike_grad=spike_grad, init_hidden=True, output=True)
+        # V5 Continuous Readout Layer (also PLIF)
+        self.lif3 = snn.Leaky(beta=torch.full((hidden,), 0.9), learn_beta=True, spike_grad=spike_grad, init_hidden=True, output=True)
         
         self.attn = TemporalAttention(hidden) #learns which timesteps are most important in the spike sequence
         self.head = nn.Linear(hidden, horizon) #final linear layer converting the learned represenation into forecast ouputs
         
         nn.init.constant_(self.proj.bias, 0.5) # Encourage initial spiking during early training
 
+    def update_surrogate_slope(self, new_slope: float):
+        from snntorch import surrogate
+        spike_grad = surrogate.fast_sigmoid(slope=new_slope)
+        self.lif1.spike_grad = spike_grad
+        self.lif2.spike_grad = spike_grad
+        self.lif3.spike_grad = spike_grad
+
+
     def forward(self, x: torch.Tensor) -> torch.Tensor: #x represents a time-series batch
         import snntorch as snn
         from snntorch import utils
         utils.reset(self) #resets membrane potentials of all spiking neurons or else the next batch starts with leftover voltage
         # from the previous batch which causes info leakage between samples.
+        
+        # Clamp learnable beta to mathematically safe ranges (prevent exponential explosion)
+        self.lif1.beta.data.clamp_(0.0, 0.99)
+        self.lif2.beta.data.clamp_(0.0, 0.99)
+        self.lif3.beta.data.clamp_(0.0, 0.99)
         
         # 1. Prepare Raw + Delta (T becomes T-1)
         delta = x[:, 1:, :] - x[:, :-1, :] #computes changes between consecutive timesteps. x : (B, T, F)
@@ -155,77 +169,77 @@ class SNNForecaster(nn.Module):
 
 class HybridForecaster(nn.Module):
     """
-    Residual SNN-Enhanced GRU Hybrid.
+    Feature-Extraction SNN-GRU Hybrid.
     
     Architectural Justification:
     ----------------------------
-    Parallel hybrids risk the SNN path "poisoning" the robust ANN baseline if 
-    the surrogate gradients fail to align. 
+    V5 shifts from a parallel Residual design to a chained Feature-Extraction paradigm.
+    - SNNs excel at early spatio-temporal dynamics (event detection).
+    - GRUs excel at deep continuous regression.
     
-    This model uses a **Residual Design**:
-    - The baseline path is a standard GRU processing raw inputs.
-    - The enhancement path is an SNN that *only* processes temporal deltas 
-      (acting as a pure neuromorphic shock/event detector).
-    - The SNN features are added to the GRU features via a gate that is 
-      **zero-initialized**.
-      
-    Result: At Epoch 1, this model is mathematically identical to a pure GRU. 
-    It only incorporates SNN features as the network explicitly learns that 
-    the "delta events" improve the regression loss.
+    This model uses the SNN to process the raw input deltas and output a sequence 
+    of rich "membrane potential features". The GRU takes those SNN features 
+    (concatenated with the raw features) as its formal input, acting as the 
+    ultimate continuous regression head.
     """
     def __init__(self, input_size: int, horizon: int, hidden: int = 128):
         super().__init__()
         import snntorch as snn
         from snntorch import surrogate
         
-        # 1. Baseline Path (GRU on Raw)
-        self.gru = nn.GRU(input_size, hidden, batch_first=True)  # Baseline Path (GRU on Raw)
-        self.gru_attn = TemporalAttention(hidden) #applies attention across time to extract a single sequence representation
-        
-        # 2. Enhancement Path (SNN on Delta)
+        # 1. Enhancement Path (SNN on Delta)
         self.snn_dim = 128 # hidden dimension for SNN and this defines spike feature dimension
         self.snn_proj = nn.Linear(input_size, self.snn_dim) #projects delta features into the spike feature space
         
         spike_grad = surrogate.fast_sigmoid(slope=25)
-        self.snn_lif = snn.Leaky(beta=0.9, spike_grad=spike_grad, init_hidden=True, output=True) #LIF neuron integrates signal and emits spikes when threshold crossed
+        # V5: PLIF Feature extractors
+        self.snn_lif1 = snn.Leaky(beta=torch.full((self.snn_dim,), 0.9), learn_beta=True, spike_grad=spike_grad, init_hidden=True) #LIF neuron integrates signal and emits spikes
+        self.snn_lif2 = snn.Leaky(beta=torch.full((self.snn_dim,), 0.9), learn_beta=True, spike_grad=spike_grad, init_hidden=True, output=True) # Reads out membrane potential
         
-        self.snn_attn = TemporalAttention(self.snn_dim) #Learns which spike moments matter most
-        self.snn_to_gru = nn.Linear(self.snn_dim, hidden) #needed for both paths to share the same dimension
-        
-        # 3. Residual Gate (Zero-initialized)
-        self.gate_proj = nn.Linear(hidden + self.snn_dim, 1) #creates a gating signal controlling how much SNN information to use
-        nn.init.constant_(self.gate_proj.weight, 0)
-        nn.init.constant_(self.gate_proj.bias, -5.0) # Sigmoid starts near 0 at the start of training and SNN contribution gradually grows during training
+        # 2. Chained GRU Path
+        self.gru = nn.GRU(input_size + self.snn_dim, hidden, batch_first=True)
+        self.gru_attn = TemporalAttention(hidden) #applies attention across time to extract a single sequence representation
         
         self.head = nn.Linear(hidden, horizon)
+
+    def update_surrogate_slope(self, new_slope: float):
+        from snntorch import surrogate
+        spike_grad = surrogate.fast_sigmoid(slope=new_slope)
+        self.snn_lif1.spike_grad = spike_grad
+        self.snn_lif2.spike_grad = spike_grad
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         import snntorch as snn
         from snntorch import utils
         utils.reset(self)
         
-        # --- Baseline Path ---
-        gru_out, _ = self.gru(x)
-        h_ann = self.gru_attn(gru_out)
+        # Clamp learnable beta to mathematically safe ranges
+        self.snn_lif1.beta.data.clamp_(0.0, 0.99)
+        self.snn_lif2.beta.data.clamp_(0.0, 0.99)
         
-        # --- Enhancement Path (Delta only) ---
+        # --- Enhancement Path (Delta only into SNN) ---
         delta = x[:, 1:, :] - x[:, :-1, :]
+        raw = x[:, 1:, :]
+        
         h_s = self.snn_proj(delta)
         h_s_t = h_s.permute(1, 0, 2)
         
         mem_rec = []
         for step in range(h_s_t.size(0)):
-            _, mem = self.snn_lif(h_s_t[step])
-            mem_rec.append(mem)
+            spk1 = self.snn_lif1(h_s_t[step])
+            _, mem2 = self.snn_lif2(spk1)
+            mem_rec.append(mem2)
         mem_rec = torch.stack(mem_rec, dim=0)
         
-        h_snn = self.snn_attn(mem_rec.permute(1, 0, 2))
+        h_snn = mem_rec.permute(1, 0, 2) # (B, T, snn_dim)
         
-        # --- Residual Fusion ---
-        g = torch.sigmoid(self.gate_proj(torch.cat([h_ann, h_snn], dim=-1))) #signmoid determines if we use SNN or ignore fully. 0 is ignore and 1 is fully use.
-        h_combined = h_ann + g * self.snn_to_gru(h_snn) #residual fusion
+        # --- Chained Baseline Path ---
+        h_combined = torch.cat([raw, h_snn], dim=-1) # (B, T, input_size + snn_dim)
         
-        return self.head(h_combined)
+        gru_out, _ = self.gru(h_combined)
+        h_ann = self.gru_attn(gru_out)
+        
+        return self.head(h_ann)
 
     def spike_count(self, x: torch.Tensor) -> int:
         import snntorch as snn
@@ -237,10 +251,13 @@ class HybridForecaster(nn.Module):
             h_s_t = h_s.permute(1, 0, 2)
             
             total_spikes = 0
-            self.snn_lif.output = False
+            self.snn_lif1.output = False
+            self.snn_lif2.output = False
             for step in range(h_s_t.size(0)):
-                spk = self.snn_lif(h_s_t[step])
-                total_spikes += int(spk.sum().item())
-            self.snn_lif.output = True
+                spk1 = self.snn_lif1(h_s_t[step])
+                spk2 = self.snn_lif2(spk1)
+                total_spikes += int(spk1.sum().item() + spk2.sum().item())
+            self.snn_lif1.output = False # default
+            self.snn_lif2.output = True
             
             return total_spikes
